@@ -1,9 +1,12 @@
 -- =====================================================================
--- CIP Phase 1 - File 3: self-cleaning test suite (UPDATED for patch file 04)
--- Run AFTER files 1, 2 and 4. Safe to re-run: it replaces the older test function. This creates a test function; it does NOT run the tests.
+-- CIP Phase 1 - File 3: self-cleaning test suite (UPDATED for patches 04 and 05)
+-- Run AFTER files 1, 2, 4, 05a and 05b. Safe to re-run: it replaces the older test function.
+-- This creates a test function; it does NOT run the tests.
 -- To run the tests:   select * from cip_run_tests();
 -- The tests build dummy data, check the rules, then roll everything back.
 -- No test data is left behind in your database.
+-- Changes vs the previous version: test 9 now uses a legal_event (the old
+-- court_matter claim type is retired); new tests 20-29 cover the legal-stage rules.
 -- =====================================================================
 
 create or replace function cip_test_result(p_no int, p_name text, p_ok boolean, p_detail text)
@@ -19,11 +22,13 @@ language plpgsql set search_path = public as $$
 declare
   res jsonb := '[]'::jsonb;
   univ uuid; inst uuid; inst_b uuid;
-  s_gov uuid; s_reg uuid; s_uni uuid; s_site uuid; s_media uuid;
+  s_gov uuid; s_reg uuid; s_uni uuid; s_site uuid; s_media uuid; s_court uuid;
   c_old uuid; c_alleg uuid; c_court uuid; c_action uuid;
-  f_a uuid; f_c uuid; f_d uuid;
-  org uuid; link1 uuid; link2 uuid; link_d uuid;
-  n int; n2 int; ok boolean; txt text; txt2 text; txt3 text;
+  c_conv uuid; c_conv2 uuid; c_acq uuid; c_acq2 uuid; c_chg uuid; c_close uuid; c_orgev uuid;
+  f_a uuid; f_c uuid; f_d uuid; f_e uuid; f_g uuid; f_h uuid;
+  org uuid; org2 uuid; link1 uuid; link2 uuid; link_d uuid;
+  n int; n2 int; n3 int; n4 int; n5 int;
+  ok boolean; ok2 boolean; n3_bool boolean; txt text; txt2 text; txt3 text; txt4 text;
   r1 record; r2 record;
   n_pass int; n_fail int;
 begin
@@ -43,6 +48,7 @@ begin
     insert into sources (title, publisher, url, authority, document_date) values ('University portal', 'Univ (test)', 'https://example.org/uni', 'university', '2025-03-01') returning id into s_uni;
     insert into sources (title, publisher, url, authority) values ('College website', 'College (test)', 'https://example.org/site', 'institution') returning id into s_site;
     insert into sources (title, publisher, url, authority) values ('News article', 'News (test)', 'https://example.org/news', 'media') returning id into s_media;
+    insert into sources (title, publisher, url, authority, doc_type, document_date) values ('Court order', 'District court (test)', 'https://example.org/court', 'court', 'court_record', '2025-04-01') returning id into s_court;
 
     -- Admissions evidence
     insert into claims (institution_id, metric_key, period_label, value_numeric, source_id, verification_status, workflow_status) values
@@ -148,19 +154,20 @@ begin
              format('old value still current=%s (want 0); old row preserved=%s (want 1); conflict after correction=%s (want true)', n, n2, ok)));
 
     ------------------------------------------------------------------
-    -- Test 9: a court matter (even a verified record of one) cannot make a flag gating
+    -- Test 9: a pending legal matter (an FIR) cannot make a flag gating
+    --         (reworked for patch 05: legal_event replaces court_matter)
     ------------------------------------------------------------------
-    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status)
-      values (inst, 'court_matter', '2024-06-01', 'Pending writ petition (test)', s_gov, 'order p.1', 'court_matter', 'government_verified', 'submitted')
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject)
+      values (inst, 'legal_event', '2024-06-01', 'FIR registered against the institution (test)', s_court, 'FIR p.1', 'legal_event', 'court_verified', 'submitted', 'fir_registered', 'institution')
       returning id into c_court;
     update claims set workflow_status = 'accepted' where id = c_court;
     insert into risk_flags (institution_id, title, category) values (inst, 'Test flag C', 'legal') returning id into f_c;
     insert into risk_flag_claims (risk_flag_id, claim_id) values (f_c, c_court);
     begin
       update risk_flags set is_gating = true where id = f_c;
-      res := res || jsonb_build_array(cip_test_result(9, 'Pending court matter cannot make a flag gating', false, 'No error was raised'));
+      res := res || jsonb_build_array(cip_test_result(9, 'Pending legal matter (FIR) cannot make a flag gating', false, 'No error was raised'));
     exception when others then
-      res := res || jsonb_build_array(cip_test_result(9, 'Pending court matter cannot make a flag gating', sqlerrm like '%cannot make a flag gating%', sqlerrm));
+      res := res || jsonb_build_array(cip_test_result(9, 'Pending legal matter (FIR) cannot make a flag gating', sqlerrm like '%cannot make a flag gating%', sqlerrm));
     end;
     begin
       insert into risk_flags (institution_id, title, category, is_gating) values (inst, 'Gating with no evidence', 'legal', true);
@@ -342,6 +349,234 @@ begin
     res := res || jsonb_build_array(cip_test_result(19, 'Identifier coverage: established / not yet researched / college-only AICTE / conflicting codes',
              txt = 'established' and txt2 = 'not_yet_researched' and n = 0 and txt3 = 'conflicted',
              format('AISHE=%s (want established); AICTE=%s (want not_yet_researched); AICTE rows for a university=%s (want 0); after a second different AISHE code=%s (want conflicted)', txt, txt2, n, txt3)));
+
+    ------------------------------------------------------------------
+    -- NEW TESTS FOR PATCH 05 (legal-stage vocabulary)
+    ------------------------------------------------------------------
+    ------------------------------------------------------------------
+    -- Test 20: every stage maps to the right class (5 allegation, 3 finding, 2 no finding)
+    ------------------------------------------------------------------
+    select count(*) filter (where cip_legal_stage_class(x) = 'allegation'),
+           count(*) filter (where cip_legal_stage_class(x) = 'finding'),
+           count(*) filter (where cip_legal_stage_class(x) = 'no_finding')
+      into n, n2, n3
+      from unnest(enum_range(null::legal_stage)) as x;
+    ok := cip_legal_stage_class('fir_registered') = 'allegation'
+      and cip_legal_stage_class('chargesheet_filed') = 'allegation'
+      and cip_legal_stage_class('conviction') = 'finding'
+      and cip_legal_stage_class('acquittal') = 'finding'
+      and cip_legal_stage_class('closed_without_finding') = 'no_finding';
+    res := res || jsonb_build_array(cip_test_result(20, 'Legal stages map to allegation / finding / no finding',
+             n = 5 and n2 = 3 and n3 = 2 and ok,
+             format('allegation=%s (want 5); finding=%s (want 3); no_finding=%s (want 2); spot checks=%s', n, n2, n3, ok)));
+
+    ------------------------------------------------------------------
+    -- Test 21: basic legal-event field rules
+    ------------------------------------------------------------------
+    begin   -- (a) no stage
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_subject)
+        values (inst, 'legal_event', '2024-07-01', 'No stage given (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'institution');
+      txt := 'No error was raised';
+    exception when others then txt := sqlerrm; end;
+    begin   -- (b) legal field on a non-legal claim
+      insert into claims (institution_id, metric_key, period_label, value_numeric, source_id, verification_status, workflow_status, legal_stage)
+        values (inst, 'approved_intake', '2020-21', 500, s_reg, 'regulatory_verified', 'submitted', 'fir_registered');
+      txt2 := 'No error was raised';
+    exception when others then txt2 := sqlerrm; end;
+    begin   -- (c) retired claim type
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status)
+        values (inst, 'regulatory_action', '2024-07-02', 'Old style court matter (test)', s_gov, 'p.1', 'court_matter', 'government_verified', 'submitted');
+      txt3 := 'No error was raised';
+    exception when others then txt3 := sqlerrm; end;
+    begin   -- (d) legal text typed as a plain fact on the legal_event metric
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status)
+        values (inst, 'legal_event', '2024-07-03', 'Typed as a plain fact (test)', s_media, 'p.1', 'fact', 'unable_to_verify', 'submitted');
+      txt4 := 'No error was raised';
+    exception when others then txt4 := sqlerrm; end;
+    begin   -- (e) a "searched, nothing found" record (no value) is allowed
+      insert into claims (institution_id, metric_key, as_of_date, verification_status, workflow_status, notes)
+        values (inst, 'legal_event', '2024-07-04', 'unable_to_verify', 'submitted', 'Searched eCourts and the High Court cause lists; nothing found (test)');
+      ok := true;
+    exception when others then ok := false; end;
+    res := res || jsonb_build_array(cip_test_result(21, 'Legal event rules: stage required; no stray legal fields; court_matter retired; not-found record allowed',
+             txt like '%needs a legal stage%' and txt2 like '%claims_legal_fields_only_for_legal_events%'
+             and txt3 like '%retired%' and txt4 like '%accepts only legal events%' and ok,
+             format('(a) "%s" | (b) "%s" | (c) "%s" | (d) "%s" | (e) not-found record accepted=%s', left(txt, 40), left(txt2, 40), left(txt3, 40), left(txt4, 40), ok)));
+
+    ------------------------------------------------------------------
+    -- Test 22: conviction rules; a court-verified, open conviction CAN make a flag gating; label shows appeal status
+    ------------------------------------------------------------------
+    begin   -- (a) a finding needs an appeal status
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject)
+        values (inst, 'legal_event', '2024-08-01', 'Conviction (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'conviction', 'institution');
+      txt := 'No error was raised';
+    exception when others then txt := sqlerrm; end;
+    begin   -- (b) court_verified needs a court source
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, appeal_status)
+        values (inst, 'legal_event', '2024-08-01', 'Conviction (test)', s_gov, 'p.1', 'legal_event', 'court_verified', 'submitted', 'conviction', 'institution', 'unknown');
+      txt2 := 'No error was raised';
+    exception when others then txt2 := sqlerrm; end;
+    begin   -- (c) court_verified is only for legal events
+      insert into claims (institution_id, metric_key, period_label, value_numeric, source_id, verification_status, workflow_status)
+        values (inst, 'approved_intake', '2020-21', 500, s_court, 'court_verified', 'submitted');
+      txt3 := 'No error was raised';
+    exception when others then txt3 := sqlerrm; end;
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, appeal_status, case_reference, last_checked_on)
+      values (inst, 'legal_event', '2024-08-01', 'Conviction of the institution (test)', s_court, 'judgment p.1', 'legal_event', 'court_verified', 'submitted', 'conviction', 'institution', 'pending', 'CC 12/2024 (test)', current_date)
+      returning id into c_conv;
+    update claims set workflow_status = 'accepted' where id = c_conv;
+    insert into risk_flags (institution_id, title, category, severity) values (inst, 'Test flag E', 'legal', 'high') returning id into f_e;
+    insert into risk_flag_claims (risk_flag_id, claim_id) values (f_e, c_conv);
+    update risk_flags set is_gating = true where id = f_e;   -- must succeed
+    select is_gating into ok from risk_flags where id = f_e;
+    select legal_display_label, is_gating_eligible into txt4, ok2 from claims_display where id = c_conv;
+    res := res || jsonb_build_array(cip_test_result(22, 'Conviction: needs appeal status and a court source; open court-verified conviction can be gating; label shows appeal status',
+             txt like '%needs an appeal status%' and txt2 like '%not allowed with a government source%' and txt3 like '%only for legal events%'
+             and ok and txt4 like '%appeal status: pending%' and ok2,
+             format('(a) "%s" | (b) "%s" | (c) "%s" | flag gating=%s | label="%s" | eligible=%s', left(txt, 30), left(txt2, 40), left(txt3, 30), ok, txt4, ok2)));
+
+    ------------------------------------------------------------------
+    -- Test 23: a media-reported conviction and an acquittal can never make a flag gating
+    ------------------------------------------------------------------
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, appeal_status)
+      values (inst, 'legal_event', '2024-08-02', 'Press report of a conviction (test)', s_media, 'para 2', 'legal_event', 'unable_to_verify', 'submitted', 'conviction', 'institution', 'unknown')
+      returning id into c_conv2;
+    update claims set workflow_status = 'accepted' where id = c_conv2;
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, appeal_status)
+      values (inst, 'legal_event', '2024-08-03', 'Acquittal in a different matter (test)', s_court, 'judgment p.3', 'legal_event', 'court_verified', 'submitted', 'acquittal', 'institution', 'unknown')
+      returning id into c_acq;
+    update claims set workflow_status = 'accepted' where id = c_acq;
+    insert into risk_flags (institution_id, title, category) values (inst, 'Test flag G', 'legal') returning id into f_g;
+    insert into risk_flag_claims (risk_flag_id, claim_id) values (f_g, c_conv2);
+    insert into risk_flags (institution_id, title, category) values (inst, 'Test flag H', 'legal') returning id into f_h;
+    insert into risk_flag_claims (risk_flag_id, claim_id) values (f_h, c_acq);
+    begin
+      update risk_flags set is_gating = true where id = f_g;
+      txt := 'No error was raised';
+    exception when others then txt := sqlerrm; end;
+    begin
+      update risk_flags set is_gating = true where id = f_h;
+      txt2 := 'No error was raised';
+    exception when others then txt2 := sqlerrm; end;
+    select legal_display_label into txt3 from claims_display where id = c_conv2;
+    res := res || jsonb_build_array(cip_test_result(23, 'Media-reported conviction and acquittal cannot make a flag gating; media conviction is labelled not court-verified',
+             txt like '%cannot make a flag gating%' and txt2 like '%cannot make a flag gating%' and txt3 like 'Reported court finding, not court-verified%',
+             format('media conviction: "%s" | acquittal: "%s" | label="%s"', left(txt, 40), left(txt2, 40), txt3)));
+
+    ------------------------------------------------------------------
+    -- Test 24: a conviction later overturned by an acquittal stops being gating-eligible
+    ------------------------------------------------------------------
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, appeal_status, earlier_event_id)
+      values (inst, 'legal_event', '2024-09-15', 'Acquittal on appeal (test)', s_court, 'judgment p.4', 'legal_event', 'court_verified', 'submitted', 'acquittal', 'institution', 'concluded', c_conv)
+      returning id into c_acq2;
+    update claims set workflow_status = 'accepted' where id = c_acq2;
+    ok := cip_claim_is_gating_eligible(c_conv);
+    select n_ineligible_claims into n from risk_flags_enriched where id = f_e;
+    res := res || jsonb_build_array(cip_test_result(24, 'Conviction overturned by a later acquittal is no longer gating-eligible; the flag shows an ineligible claim',
+             not ok and n = 1,
+             format('conviction still eligible=%s (want false); ineligible claims on flag E=%s (want 1)', ok, n)));
+
+    ------------------------------------------------------------------
+    -- Test 25: subject rules (institution or its organisation only)
+    ------------------------------------------------------------------
+    begin   -- (a) organisation subject without an organisation
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject)
+        values (inst, 'legal_event', '2024-10-01', 'Civil suit (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'civil_suit_filed', 'organisation');
+      txt := 'No error was raised';
+    exception when others then txt := sqlerrm; end;
+    begin   -- (b) an institution subject must not name an organisation
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, legal_subject_org_id)
+        values (inst, 'legal_event', '2024-10-01', 'Civil suit (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'civil_suit_filed', 'institution', org);
+      txt2 := 'No error was raised';
+    exception when others then txt2 := sqlerrm; end;
+    begin   -- (c) individuals are not an allowed subject
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject)
+        values (inst, 'legal_event', '2024-10-01', 'FIR against a trustee (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'fir_registered', 'individual');
+      txt3 := 'No error was raised';
+    exception when others then txt3 := sqlerrm; end;
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, legal_subject_org_id)
+      values (inst, 'legal_event', '2024-10-02', 'Civil suit against the owning trust (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'civil_suit_filed', 'organisation', org)
+      returning id into c_orgev;
+    update claims set workflow_status = 'accepted' where id = c_orgev;
+    select legal_subject_org_name into txt4 from claims_display where id = c_orgev;
+    res := res || jsonb_build_array(cip_test_result(25, 'Legal subject: organisation subject needs an organisation; institution subject must not name one; individuals not allowed',
+             txt like '%needs an organisation%' and txt2 like '%must not name an organisation%'
+             and txt3 like '%claims_legal_subject_values%' and txt4 = 'ZZ Test Educational Trust',
+             format('(a) "%s" | (b) "%s" | (c) "%s" | linked org shown as "%s"', left(txt, 35), left(txt2, 35), left(txt3, 35), txt4)));
+
+    ------------------------------------------------------------------
+    -- Test 26: timeline link and correction rules
+    ------------------------------------------------------------------
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, earlier_event_id)
+      values (inst, 'legal_event', '2024-07-10', 'Chargesheet filed (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'chargesheet_filed', 'institution', c_court)
+      returning id into c_chg;
+    update claims set workflow_status = 'accepted' where id = c_chg;
+    begin   -- (a) earlier event with a different subject
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, legal_subject_org_id, earlier_event_id)
+        values (inst, 'legal_event', '2024-07-11', 'Chargesheet against the trust (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'chargesheet_filed', 'organisation', org, c_court);
+      txt := 'No error was raised';
+    exception when others then txt := sqlerrm; end;
+    begin   -- (b) a correction cannot change the stage (FIR -> conviction)
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, appeal_status, supersedes_id)
+        values (inst, 'legal_event', '2024-06-01', 'FIR turned into a conviction (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'conviction', 'institution', 'unknown', c_court);
+      txt2 := 'No error was raised';
+    exception when others then txt2 := sqlerrm; end;
+    begin   -- (c) earlier event must be a legal event
+      insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, earlier_event_id)
+        values (inst, 'legal_event', '2024-07-12', 'Follows a non-legal claim (test)', s_court, 'p.1', 'legal_event', 'court_verified', 'submitted', 'chargesheet_filed', 'institution', c_alleg);
+      txt3 := 'No error was raised';
+    exception when others then txt3 := sqlerrm; end;
+    res := res || jsonb_build_array(cip_test_result(26, 'Timeline: earlier event must be a legal event with the same subject; a correction cannot change the stage',
+             txt like '%same subject%' and txt2 like '%same legal stage%' and txt3 like '%accepted legal event%',
+             format('(a) "%s" | (b) "%s" | (c) "%s"', left(txt, 40), left(txt2, 40), left(txt3, 40))));
+
+    ------------------------------------------------------------------
+    -- Test 27: a later closure shows on earlier events, through the whole chain (FIR -> chargesheet -> closed)
+    ------------------------------------------------------------------
+    ok := cip_legal_event_ended_later(c_court);     -- before the closure exists: expect false
+    insert into claims (institution_id, metric_key, as_of_date, value_text, source_id, locator, claim_type, verification_status, workflow_status, legal_stage, legal_subject, earlier_event_id)
+      values (inst, 'legal_event', '2024-12-01', 'Case closed, no finding (test)', s_court, 'order p.2', 'legal_event', 'court_verified', 'submitted', 'closed_without_finding', 'institution', c_chg)
+      returning id into c_close;
+    update claims set workflow_status = 'accepted' where id = c_close;
+    ok2 := cip_legal_event_ended_later(c_court);    -- FIR, two steps up the chain: expect true
+    select cip_legal_event_ended_later(c_chg)::int, cip_legal_event_ended_later(c_orgev)::int into n, n2;
+    select legal_ended_by_later_event into n3_bool from claims_display where id = c_court;
+    res := res || jsonb_build_array(cip_test_result(27, 'Later closure marks earlier events as ended (through the chain); unrelated events are not',
+             not ok and ok2 and n = 1 and n2 = 0 and coalesce(n3_bool, false),
+             format('FIR ended before closure=%s (want false); after closure=%s (want true); chargesheet ended=%s (want 1); unrelated org event ended=%s (want 0); shown in claims_display=%s (want true)',
+                    ok, ok2, n, n2, n3_bool)));
+
+    ------------------------------------------------------------------
+    -- Test 28: legal events never show as "Conflicting Sources"; coverage shows legal_event, not court_matter
+    ------------------------------------------------------------------
+    select count(*) into n from claim_groups where institution_id = inst and metric_key = 'legal_event';
+    select count(*) into n2 from claims_display where institution_id = inst and metric_key = 'legal_event' and is_conflicted;
+    select count(*) into n3 from claims_display where institution_id = inst and metric_key = 'legal_event';
+    select coverage_status into txt from institution_metric_coverage where institution_id = inst and metric_key = 'legal_event';
+    select count(*) into n4 from institution_metric_coverage where institution_id = inst and metric_key = 'court_matter';
+    select count(*) into n5 from institution_metric_coverage where institution_id = inst;
+    res := res || jsonb_build_array(cip_test_result(28, 'No false conflicts between legal events; coverage lists legal_event (25 rows), not court_matter',
+             n = 0 and n2 = 0 and n3 = 8 and txt = 'established' and n4 = 0 and n5 = 25,
+             format('legal conflict groups=%s (want 0); conflicted legal events shown=%s (want 0); current legal events=%s (want 8); legal_event coverage=%s (want established); court_matter rows=%s (want 0); total coverage rows=%s (want 25)', n, n2, n3, txt, n4, n5)));
+
+    ------------------------------------------------------------------
+    -- Test 29: after acceptance only last_checked_on may change
+    ------------------------------------------------------------------
+    begin
+      update claims set last_checked_on = date '2025-01-01' where id = c_conv;
+      txt := 'updated';
+    exception when others then txt := sqlerrm; end;
+    begin
+      update claims set value_text = 'changed' where id = c_conv;
+      txt2 := 'No error was raised';
+    exception when others then txt2 := sqlerrm; end;
+    begin
+      update claims set appeal_status = 'concluded' where id = c_conv;
+      txt3 := 'No error was raised';
+    exception when others then txt3 := sqlerrm; end;
+    res := res || jsonb_build_array(cip_test_result(29, 'Accepted legal event: last_checked_on can be updated; description and appeal status cannot',
+             txt = 'updated' and txt2 like '%cannot be edited after submission%' and txt3 like '%cannot be edited after submission%',
+             format('last_checked_on: "%s" | description edit: "%s" | appeal status edit: "%s"', left(txt, 30), left(txt2, 40), left(txt3, 40))));
 
     raise exception 'cip_rollback';   -- undo every test row
   exception when others then
